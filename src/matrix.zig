@@ -4,8 +4,6 @@ const MatrixError = error{
     NonMatchingDims,
 };
 
-const matrix_block_size = 64;
-
 pub const Matrix = struct {
     rows: usize,
     cols: usize,
@@ -60,7 +58,7 @@ pub const Matrix = struct {
 
         var result = try Matrix.init(allocator, self.rows, other.cols);
 
-        try blockGemm(self, other, &result, allocator);
+        try blockGemm(self, other, &result);
 
         return result;
     }
@@ -82,14 +80,22 @@ pub const Matrix = struct {
         other.transpose();
     }
 
-    fn blockGemm(self: *Matrix, other: *Matrix, result: *Matrix, allocator: std.mem.Allocator) !void {
-        const num_m_blocks = (self.rows + matrix_block_size - 1) / matrix_block_size;
-        const num_n_blocks = (other.rows + matrix_block_size - 1) / matrix_block_size;
-        const num_p_blocks = (other.cols + matrix_block_size - 1) / matrix_block_size;
+    fn blockGemm(self: *Matrix, other: *Matrix, result: *Matrix) !void {
+        const matrix_block_size = 64;
 
-        const one_block = try allocator.alloc(f32, matrix_block_size * matrix_block_size);
-        const two_block = try allocator.alloc(f32, matrix_block_size * matrix_block_size);
-        const thr_block = try allocator.alloc(f32, matrix_block_size * matrix_block_size);
+        const blk_f32 = @Vector(matrix_block_size, f32);
+
+        const m = self.rows;
+        const n = other.rows;
+        const p = other.cols;
+
+        const num_m_blocks = (m + matrix_block_size - 1) / matrix_block_size;
+        const num_n_blocks = (n + matrix_block_size - 1) / matrix_block_size;
+        const num_p_blocks = (p + matrix_block_size - 1) / matrix_block_size;
+
+        var one_block: [matrix_block_size * matrix_block_size]f32 = undefined;
+        var two_block: [matrix_block_size * matrix_block_size]f32 = undefined;
+        var thr_block: [matrix_block_size * matrix_block_size]f32 = undefined;
 
         other.transpose();
 
@@ -108,12 +114,9 @@ pub const Matrix = struct {
                     }
 
                     // set local blocks
-                    const self_block_idx = m_idx * matrix_block_size * self.cols + n_idx * matrix_block_size;
-                    const other_block_idx = n_idx * matrix_block_size * other.cols + p_idx * matrix_block_size;
-                    const result_block_idx = m_idx * matrix_block_size * result.cols + p_idx * matrix_block_size;
-
                     const self_block_width = @min(n_idx * matrix_block_size + matrix_block_size, self.cols) - (n_idx * matrix_block_size);
                     const self_block_height = @min(m_idx * matrix_block_size + matrix_block_size, self.rows) - (m_idx * matrix_block_size);
+                    const self_block_idx = m_idx * matrix_block_size * self.cols + n_idx * matrix_block_size;
 
                     for (0..self_block_height) |i| {
                         for (0..self_block_width) |j| {
@@ -124,8 +127,9 @@ pub const Matrix = struct {
                         }
                     }
 
-                    const other_block_width = @min(p_idx * matrix_block_size + matrix_block_size, other.cols) - (p_idx * matrix_block_size);
-                    const other_block_height = @min(n_idx * matrix_block_size + matrix_block_size, other.rows) - (n_idx * matrix_block_size);
+                    const other_block_width = @min(n_idx * matrix_block_size + matrix_block_size, n) - (n_idx * matrix_block_size);
+                    const other_block_height = @min(p_idx * matrix_block_size + matrix_block_size, p) - (p_idx * matrix_block_size);
+                    const other_block_idx = p_idx * matrix_block_size * n + n_idx * matrix_block_size;
 
                     for (0..other_block_height) |i| {
                         for (0..other_block_width) |j| {
@@ -139,19 +143,24 @@ pub const Matrix = struct {
                     // perform calc
                     for (0..matrix_block_size) |i| {
                         for (0..matrix_block_size) |j| {
-                            for (0..matrix_block_size) |k| {
-                                thr_block[i * matrix_block_size + j] += one_block[i * matrix_block_size + k] * two_block[k * matrix_block_size + j];
-                            }
+                            const one_vec: blk_f32 = (&one_block)[i * matrix_block_size ..][0..matrix_block_size].*;
+                            const two_vec: blk_f32 = (&two_block)[j * matrix_block_size ..][0..matrix_block_size].*;
+
+                            const sum_vec = one_vec * two_vec;
+
+                            thr_block[i * matrix_block_size + j] = @reduce(.Add, sum_vec);
                         }
                     }
 
                     // copy thr_block to result
-                    for (0..matrix_block_size) |i| {
-                        for (0..matrix_block_size) |j| {
+                    const result_block_width = @min(p_idx * matrix_block_size + matrix_block_size, n) - (p_idx * matrix_block_size);
+                    const result_block_height = @min(m_idx * matrix_block_size + matrix_block_size, m) - (m_idx * matrix_block_size);
+                    const result_block_idx = m_idx * matrix_block_size * n + p_idx * matrix_block_size;
+
+                    for (0..result_block_height) |i| {
+                        for (0..result_block_width) |j| {
                             const result_idx = result_block_idx + i * result.cols + j;
-                            if (result_idx < result.data.len) {
-                                result.data[result_idx] += thr_block[i * matrix_block_size + j];
-                            }
+                            result.data[result_idx] += thr_block[i * matrix_block_size + j];
                         }
                     }
                 }
