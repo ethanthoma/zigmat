@@ -1,48 +1,51 @@
 const std = @import("std");
-const math = std.math;
 
-pub const Neuron = struct {
-    weights: []f32,
-    bias: f32,
+const Matrix = @import("matrix.zig").Matrix;
 
-    pub fn init(allocator: std.mem.Allocator, input_size: usize) !Neuron {
-        return Neuron{
-            .weights = try allocator.alloc(f32, input_size),
-            .bias = 0,
-        };
+fn prettyPrintTime(allocator: std.mem.Allocator, duration: u64) ![]const u8 {
+    const sec = @as(f64, @floatFromInt(duration)) / 1_000_000_000;
+    const ms = @as(f64, @floatFromInt(duration)) / 1_000_000;
+    const us = @as(f64, @floatFromInt(duration)) / 1_000;
+
+    if (sec >= 1) {
+        return try std.fmt.allocPrint(allocator, "{:.3} s", .{sec});
+    } else if (ms >= 1) {
+        return try std.fmt.allocPrint(allocator, "{:.3} ms", .{ms});
+    } else if (us >= 1) {
+        return try std.fmt.allocPrint(allocator, "{:.3} us", .{us});
+    } else {
+        return try std.fmt.allocPrint(allocator, "{} ns", .{duration});
     }
-
-    pub fn compute(self: Neuron, inputs: []f32) f32 {
-        var sum: f32 = 0.0;
-        for (0.., self.weights) |i, weight| {
-            sum += weight * inputs[i];
-        }
-
-        return sum + self.bias;
-    }
-};
+}
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
 
-    // Example data
-    var trainInput = [_]f32{ 0.5, -1.2 };
-    const trainOutput = 0.1;
+    const n: usize = 1024;
+    const m: usize = n;
 
-    const inputDim = trainInput.len;
-    const outDim = 1;
+    var mat = try Matrix.init(allocator, n, m);
+    var mat2 = try Matrix.identity(allocator, m, n);
 
-    // Initialize neurons
-    var hidden_neuron = try Neuron.init(allocator, inputDim);
-    var output_neuron = try Neuron.init(allocator, outDim);
+    var count: f32 = 1;
+    for (0..n) |i| {
+        for (0..m) |j| {
+            mat.setValue(i, j, count);
+            count += 1;
+        }
+    }
 
-    // Forward pass through the input neuron
-    var hidden_output = [outDim]f32{hidden_neuron.compute(trainInput[0..])};
+    var timer = try std.time.Timer.start();
+    const result = try mat.matmul(&mat2, allocator);
+    const duration = timer.read();
+    const time = try prettyPrintTime(allocator, duration);
 
-    // Forward pass through the output neuron
-    const output = output_neuron.compute(hidden_output[0..]);
+    std.debug.print("Matrix multiplication of two {}x{} matrices took {s}.\n", .{ n, n, time });
 
-    std.debug.print("Network output: {}\n", .{output});
-    std.debug.print("Loss: {}\n", .{output - trainOutput});
+    for (0..n) |i| {
+        for (0..m) |j| {
+            std.debug.assert(mat.data[i * n + j] == result.data[i * n + j]);
+        }
+    }
 }
