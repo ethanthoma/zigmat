@@ -37,9 +37,20 @@ pub fn main() !void {
     }
 
     var timer = try std.time.Timer.start();
+    mat.transpose();
+    var duration = timer.read();
+    var time = try prettyPrintTime(allocator, duration);
+
+    mat.transpose();
+
+    std.debug.print("Matrix transpose of a {}x{} matrices took {s}.\n", .{ n, n, time });
+
+    mat.transpose();
+
+    timer = try std.time.Timer.start();
     const result = try mat.matmul(&mat2, allocator);
-    const duration = timer.read();
-    const time = try prettyPrintTime(allocator, duration);
+    duration = timer.read();
+    time = try prettyPrintTime(allocator, duration);
 
     std.debug.print("Matrix multiplication of two {}x{} matrices took {s}.\n", .{ n, n, time });
 
