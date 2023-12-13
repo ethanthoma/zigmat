@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const Matrix = @import("matrix.zig").Matrix;
+const Matrix = @import("matrix.zig");
 
 fn prettyPrintTime(allocator: std.mem.Allocator, duration: u64) ![]const u8 {
     const sec = @as(f64, @floatFromInt(duration)) / 1_000_000_000;
@@ -18,21 +18,55 @@ fn prettyPrintTime(allocator: std.mem.Allocator, duration: u64) ![]const u8 {
     }
 }
 
-pub fn main() !void {}
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
 
-test "thread pool" {
-    const thread_pool_options = std.Thread.Pool.Options{ .allocator = std.testing.allocator };
-    var thread_pool: std.Thread.Pool = undefined;
+    const m: usize = 2048;
+    const n: usize = m;
+    const p: usize = n;
 
-    try thread_pool.init(thread_pool_options);
-    defer thread_pool.deinit();
+    // define A: matrix going from 1 to m*n
+    var A = try Matrix.init(allocator, m, n);
+    defer A.deinit();
 
-    const n_jobs = 1000000;
-    for (0..n_jobs) |i| {
-        try thread_pool.spawn(threadFunction, .{i});
+    var count: f32 = 1;
+    for (0..m) |i| {
+        for (0..n) |j| {
+            A.setValue(i, j, count);
+            count += 1;
+        }
     }
-}
 
-fn threadFunction(arg: usize) void {
-    std.debug.print("Thread: {}\n", .{arg});
+    // define B: matrix of 1s
+    var B = try Matrix.init(allocator, n, p);
+    defer B.deinit();
+
+    for (0..n) |i| {
+        for (0..p) |j| {
+            B.setValue(i, j, 1);
+        }
+    }
+
+    // timer
+    var timer = try std.time.Timer.start();
+
+    const C = try A.matmul(&B);
+    defer C.deinit();
+
+    const duration = timer.read();
+    const time = try prettyPrintTime(allocator, duration);
+    defer allocator.free(time);
+
+    std.debug.print("\nMatrix multiplication of a {}x{} matrix and a {}x{} matrix took {s}.\n", .{ m, n, n, p, time });
+
+    // test
+    const base_val: f32 = (n * (n + 1)) / 2;
+    const tol = std.math.floatEps(f32) * (n + 1);
+    for (0..m) |i| {
+        const i_f32: f32 = @floatFromInt(i);
+        for (0..p) |j| {
+            try std.testing.expectApproxEqRel(base_val + i_f32 * n * n, C.data[i * p + j], tol);
+        }
+    }
 }
