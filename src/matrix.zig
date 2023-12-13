@@ -75,8 +75,8 @@ pub fn transpose(self: *Matrix) !Matrix {
 test "transpose" {
     const allocator = std.testing.allocator;
 
-    const m: usize = 7;
-    const n: usize = 6;
+    const m: usize = 64;
+    const n: usize = 30;
 
     var initial = try Matrix.init(allocator, m, n);
     defer initial.deinit();
@@ -119,11 +119,9 @@ test "transpose" {
 const block_size = 8;
 const Block = [block_size * block_size]f32;
 
-threadlocal var block_A: Block = undefined;
-threadlocal var block_B: Block = undefined;
-threadlocal var block_C: Block = undefined;
-
-const max_threads = 100000;
+threadlocal var block_A: Block align(64) = undefined;
+threadlocal var block_B: Block align(64) = undefined;
+threadlocal var block_C: Block align(64) = undefined;
 
 pub fn matmul(self: *Matrix, other: *Matrix) !Matrix {
     if (self.cols != other.rows) {
@@ -144,55 +142,51 @@ pub fn matmul(self: *Matrix, other: *Matrix) !Matrix {
     const num_n_blocks = (n + block_size - 1) / block_size;
     const num_p_blocks = (p + block_size - 1) / block_size;
 
-    if (num_m_blocks > max_threads) {
-        const thread_pool_options = std.Thread.Pool.Options{ .allocator = allocator };
-        var thread_pool: std.Thread.Pool = undefined;
-        try thread_pool.init(thread_pool_options);
-        defer thread_pool.deinit();
+    const thread_pool_options = std.Thread.Pool.Options{ .n_jobs = @intCast(num_m_blocks), .allocator = allocator };
+    var thread_pool: std.Thread.Pool = undefined;
+    try thread_pool.init(thread_pool_options);
+    defer thread_pool.deinit();
 
-        for (0..num_n_blocks) |m_idx| {
-            try thread_pool.spawn(from0toNum_p_blocks, .{ self, other, &result, m_idx, num_n_blocks, num_p_blocks });
-        }
-    } else {
-        var threads = try allocator.alloc(std.Thread, num_m_blocks);
-        for (0..num_m_blocks) |m_idx| {
-            threads[m_idx] = try std.Thread.spawn(.{ .allocator = self.allocator }, from0toNum_p_blocks, .{ self, other, &result, m_idx, num_n_blocks, num_p_blocks });
-        }
-
-        for (0..num_m_blocks) |i| {
-            threads[i].join();
-        }
+    // emulate parallel for
+    for (0..num_m_blocks) |m_idx| {
+        try thread_pool.spawn(processBlocksRange, .{ self, other, &result, m_idx, num_n_blocks, num_p_blocks });
     }
 
     return result;
 }
 
-fn from0toNum_p_blocks(matrix_A: *Matrix, matrix_B: *Matrix, result: *Matrix, m_idx: usize, num_n_blocks: usize, num_p_blocks: usize) void {
-    for (0..num_p_blocks) |p_idx| {
-        for (0..num_n_blocks) |n_idx| {
-            computeBlock(matrix_A, matrix_B, result, m_idx, p_idx, n_idx);
+inline fn processBlocksRange(matrix_A: *Matrix, matrix_B: *Matrix, result: *Matrix, m_idx: usize, num_n_blocks: usize, num_p_blocks: usize) void {
+    const m = matrix_A.rows;
+    const n = matrix_B.rows;
+    const p = matrix_B.cols;
+
+    const block_m_size = @min(m_idx * block_size + block_size, m) - (m_idx * block_size);
+
+    for (0..num_n_blocks) |n_idx| {
+        const block_n_size = @min(n_idx * block_size + block_size, n) - (n_idx * block_size);
+        for (0..num_p_blocks) |p_idx| {
+            const block_p_size = @min(p_idx * block_size + block_size, p) - (p_idx * block_size);
+
+            const block_a_idx = (m_idx * n + n_idx) * block_size;
+            blockA(matrix_A, block_m_size, block_n_size, block_a_idx);
+
+            const block_b_idx = (n_idx * p + p_idx) * block_size;
+            blockB(matrix_B, block_n_size, block_p_size, block_b_idx);
+
+            multiplyBlocks();
+
+            const block_c_idx = (m_idx * p + p_idx) * block_size;
+            copyBlockToMatrix(result, block_m_size, block_p_size, block_c_idx);
         }
     }
 }
 
-inline fn computeBlock(matrix_A: *Matrix, matrix_B: *Matrix, result: *Matrix, m_idx: usize, p_idx: usize, n_idx: usize) void {
-    blockA(matrix_A, m_idx, n_idx);
-    blockB(matrix_B, n_idx, p_idx);
-    multiplyBlocks();
-    copyBlockToMatrix(result, m_idx, p_idx);
-}
-
-inline fn copyBlockToMatrix(matrix: *Matrix, block_i: usize, block_j: usize) void {
-    const m = matrix.rows;
-    const p = matrix.cols;
-
-    const block_height = @min(block_i * block_size + block_size, m) - (block_i * block_size);
-    const block_width = @min(block_j * block_size + block_size, p) - (block_j * block_size);
-    const block_idx = (block_i * p + block_j) * block_size;
+inline fn copyBlockToMatrix(matrix: *Matrix, block_height: usize, block_width: usize, block_idx: usize) void {
+    const n = matrix.cols;
 
     for (0..block_height) |i| {
         for (0..block_width) |j| {
-            const idx = block_idx + i * p + j;
+            const idx = block_idx + i * n + j;
             matrix.data[idx] += block_C[i * block_size + j];
         }
     }
@@ -211,13 +205,8 @@ inline fn multiplyBlocks() void {
     }
 }
 
-inline fn blockA(matrix: *Matrix, block_i: usize, block_j: usize) void {
-    const m = matrix.rows;
+inline fn blockA(matrix: *Matrix, block_height: usize, block_width: usize, block_idx: usize) void {
     const n = matrix.cols;
-
-    const block_height = @min(block_i * block_size + block_size, m) - (block_i * block_size);
-    const block_width = @min(block_j * block_size + block_size, n) - (block_j * block_size);
-    const block_idx = (block_i * n + block_j) * block_size;
 
     for (0..block_height) |i| {
         for (0..block_width) |j| {
@@ -240,13 +229,8 @@ inline fn blockA(matrix: *Matrix, block_i: usize, block_j: usize) void {
     }
 }
 
-inline fn blockB(matrix: *Matrix, block_i: usize, block_j: usize) void {
-    const m = matrix.rows;
+inline fn blockB(matrix: *Matrix, block_height: usize, block_width: usize, block_idx: usize) void {
     const n = matrix.cols;
-
-    const block_height = @min(block_i * block_size + block_size, m) - (block_i * block_size);
-    const block_width = @min(block_j * block_size + block_size, n) - (block_j * block_size);
-    const block_idx = (block_i * n + block_j) * block_size;
 
     for (0..block_height) |i| {
         for (0..block_width) |j| {

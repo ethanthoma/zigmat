@@ -22,9 +22,9 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
 
-    const m: usize = 2048;
-    const n: usize = m;
-    const p: usize = n;
+    const m: usize = 1024;
+    const n: usize = 1024;
+    const p: usize = 1024;
 
     // define A: matrix going from 1 to m*n
     var A = try Matrix.init(allocator, m, n);
