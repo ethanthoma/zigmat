@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = std.debug.assert;
 const debug = std.debug;
 const testing = std.testing;
 const mem = std.mem;
@@ -11,7 +12,11 @@ const MatrixError = error{
     DifferentTypes,
 };
 
+const cache_line_size = 64;
+
 pub fn Matrix(comptime T: type) type {
+    assert(@typeInfo(T) == .Float or @typeInfo(T) == .Int);
+
     return struct {
         const Self = @This();
 
@@ -21,7 +26,7 @@ pub fn Matrix(comptime T: type) type {
         allocator: Allocator,
 
         pub fn init(allocator: Allocator, rows: usize, cols: usize) Allocator.Error!Self {
-            const data = try allocator.alloc(T, rows * cols);
+            const data = try allocator.alignedAlloc(T, cache_line_size, rows * cols);
 
             @memset(data, 0.0);
 
@@ -69,7 +74,7 @@ pub fn Matrix(comptime T: type) type {
             const m = self.rows;
             const n = self.cols;
 
-            var result = try Matrix.init(self.allocator, n, m);
+            var result = try Matrix(T).init(self.allocator, n, m);
 
             for (0..m) |i| {
                 for (0..n) |j| {
@@ -80,55 +85,12 @@ pub fn Matrix(comptime T: type) type {
             return result;
         }
 
-        test "transpose" {
-            const allocator = testing.allocator;
-
-            const m: usize = 64;
-            const n: usize = 30;
-
-            var initial = try Matrix(f32).init(allocator, m, n);
-            defer initial.deinit();
-
-            var expected = try Matrix(f32).init(allocator, n, m);
-            defer expected.deinit();
-
-            var count: f32 = 1;
-            for (0..m) |i| {
-                for (0..n) |j| {
-                    initial.setValue(i, j, count);
-                    count += 1;
-                }
-            }
-
-            count = 1;
-            for (0..m) |j| {
-                for (0..n) |i| {
-                    expected.setValue(i, j, count);
-                    count += 1;
-                }
-            }
-
-            const actual = try initial.transpose();
-            defer actual.deinit();
-
-            // verify
-            try testing.expectEqual(n, actual.rows);
-            try testing.expectEqual(m, actual.cols);
-
-            const tol = std.math.floatEps(f32);
-            for (0..n) |i| {
-                for (0..m) |j| {
-                    try std.testing.expectApproxEqRel(expected.data[i * m + j], actual.data[i * m + j], tol);
-                }
-            }
-        }
-
-        const block_size = 64 / @sizeOf(T);
+        const block_size = cache_line_size / @sizeOf(T);
         const Block = [block_size * block_size]T;
 
-        threadlocal var block_A: Block align(64) = undefined;
-        threadlocal var block_B: Block align(64) = undefined;
-        threadlocal var block_C: Block align(64) = undefined;
+        threadlocal var block_A: Block align(cache_line_size) = undefined;
+        threadlocal var block_B: Block align(cache_line_size) = undefined;
+        threadlocal var block_C: Block align(cache_line_size) = undefined;
 
         pub fn matmul(self: *Self, other: *Self) !Self {
             if (self.cols != other.rows) {
@@ -153,12 +115,12 @@ pub fn Matrix(comptime T: type) type {
             const num_n_blocks = (n + block_size - 1) / block_size;
             const num_p_blocks = (p + block_size - 1) / block_size;
 
+            // emulate parallel for
             const thread_pool_options = std.Thread.Pool.Options{ .n_jobs = @intCast(num_m_blocks), .allocator = allocator };
             var thread_pool: std.Thread.Pool = undefined;
             try thread_pool.init(thread_pool_options);
             defer thread_pool.deinit();
 
-            // emulate parallel for
             for (0..num_m_blocks) |m_idx| {
                 try thread_pool.spawn(processBlocksRange, .{ self, other, &result, m_idx, num_n_blocks, num_p_blocks });
             }
@@ -218,13 +180,12 @@ pub fn Matrix(comptime T: type) type {
             @prefetch(&block_C, .{ .rw = .write });
 
             inline for (0..block_size) |i| {
+                const vec_A: @Vector(block_size, T) = block_A[i * block_size ..][0..block_size].*;
+
                 inline for (0..block_size) |j| {
-                    const vec_A: @Vector(block_size, T) = block_A[i * block_size ..][0..block_size].*;
                     const vec_B: @Vector(block_size, T) = block_B[j * block_size ..][0..block_size].*;
 
-                    const sum_vec = vec_A * vec_B;
-
-                    block_C[i * block_size + j] = @reduce(.Add, sum_vec);
+                    block_C[i * block_size + j] = @reduce(.Add, vec_A * vec_B);
                 }
             }
         }
@@ -268,55 +229,98 @@ pub fn Matrix(comptime T: type) type {
             // zero padding
             inline for (0..block_size) |j| {
                 const block_start_index = j * block_size;
-                @memset(block_A[block_start_index + block_height .. block_start_index + block_size], 0);
+                @memset(block_B[block_start_index + block_height .. block_start_index + block_size], 0);
 
                 if (j >= block_width) {
                     @memset(block_B[block_start_index .. block_start_index + block_height], 0);
                 }
             }
         }
-
-        test "matmul" {
-            const allocator = testing.allocator;
-
-            const m: usize = 8;
-            const n: usize = 9;
-            const p: usize = 10;
-
-            // define A: matrix going from 1 to m*n
-            var A = try Matrix(f32).init(allocator, m, n);
-            defer A.deinit();
-
-            var count: f32 = 1;
-            for (0..m) |i| {
-                for (0..n) |j| {
-                    A.setValue(i, j, count);
-                    count += 1;
-                }
-            }
-
-            // define B: matrix of 1s
-            var B = try Matrix(f32).init(allocator, n, p);
-            defer B.deinit();
-
-            for (0..n) |i| {
-                for (0..p) |j| {
-                    B.setValue(i, j, 1);
-                }
-            }
-
-            const C = try A.matmul(&B);
-            defer C.deinit();
-
-            // test
-            const base_val: f32 = (n * (n + 1)) / 2;
-            const tol = (std.math.floatEps(f32) * n) * (1 + std.math.floatEps(f32));
-            for (0..m) |i| {
-                const i_f32: f32 = @floatFromInt(i);
-                for (0..p) |j| {
-                    try std.testing.expectApproxEqRel(base_val + i_f32 * n * n, C.data[i * p + j], tol);
-                }
-            }
-        }
     };
+}
+
+test "transpose" {
+    const allocator = testing.allocator;
+
+    const m: usize = 64;
+    const n: usize = 30;
+
+    var initial = try Matrix(f32).init(allocator, m, n);
+    defer initial.deinit();
+
+    var expected = try Matrix(f32).init(allocator, n, m);
+    defer expected.deinit();
+
+    var count: f32 = 1;
+    for (0..m) |i| {
+        for (0..n) |j| {
+            initial.setValue(i, j, count);
+            count += 1;
+        }
+    }
+
+    count = 1;
+    for (0..m) |j| {
+        for (0..n) |i| {
+            expected.setValue(i, j, count);
+            count += 1;
+        }
+    }
+
+    const actual = try initial.transpose();
+    defer actual.deinit();
+
+    // verify
+    try testing.expectEqual(n, actual.rows);
+    try testing.expectEqual(m, actual.cols);
+
+    const tol = std.math.floatEps(f32);
+    for (0..n) |i| {
+        for (0..m) |j| {
+            try testing.expectApproxEqRel(expected.data[i * m + j], actual.data[i * m + j], tol);
+        }
+    }
+}
+
+test "matmul" {
+    const allocator = testing.allocator;
+
+    const m: usize = 8;
+    const n: usize = 9;
+    const p: usize = 10;
+
+    // define A: matrix going from 1 to m*n
+    var A = try Matrix(f32).init(allocator, m, n);
+    defer A.deinit();
+
+    var count: f32 = 1;
+    for (0..m) |i| {
+        for (0..n) |j| {
+            A.setValue(i, j, count);
+            count += 1;
+        }
+    }
+
+    // define B: matrix of 1s
+    var B = try Matrix(f32).init(allocator, n, p);
+    defer B.deinit();
+
+    for (0..n) |i| {
+        for (0..p) |j| {
+            B.setValue(i, j, 1);
+        }
+    }
+
+    const C = try A.matmul(&B);
+    defer C.deinit();
+
+    // test
+    const base_val: f32 = (n * (n + 1)) / 2;
+    const tol = (std.math.floatEps(f32) * n) * (1 + std.math.floatEps(f32));
+    for (0..m) |i| {
+        const i_f32: f32 = @floatFromInt(i);
+        for (0..p) |j| {
+            try testing.expectApproxEqRel(base_val + i_f32 * n * n, C.data[i * p + j], tol);
+        }
+    }
 }
