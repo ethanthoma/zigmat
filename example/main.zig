@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const Matrix = @import("matrix.zig").Matrix;
+const Matrix = @import("zigmat").Matrix;
 
 fn prettyPrintTime(allocator: std.mem.Allocator, duration: u64) ![]const u8 {
     const sec = @as(f64, @floatFromInt(duration)) / 1_000_000_000;
