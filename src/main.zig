@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const Matrix = @import("matrix.zig");
+const Matrix = @import("matrix.zig").Matrix;
 
 fn prettyPrintTime(allocator: std.mem.Allocator, duration: u64) ![]const u8 {
     const sec = @as(f64, @floatFromInt(duration)) / 1_000_000_000;
@@ -27,7 +27,7 @@ pub fn main() !void {
     const p: usize = n;
 
     // define A: matrix going from 1 to m*n
-    var A = try Matrix.init(allocator, m, n);
+    var A = try Matrix(f32).init(allocator, m, n);
     defer A.deinit();
 
     var count: f32 = 1;
@@ -39,7 +39,7 @@ pub fn main() !void {
     }
 
     // define B: matrix of 1s
-    var B = try Matrix.init(allocator, n, p);
+    var B = try Matrix(f32).init(allocator, n, p);
     defer B.deinit();
 
     for (0..n) |i| {
