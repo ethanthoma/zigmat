@@ -15,9 +15,7 @@ allocator: std.mem.Allocator,
 pub fn init(allocator: std.mem.Allocator, rows: usize, cols: usize) !Matrix {
     const data = try allocator.alloc(f32, rows * cols);
 
-    for (0..rows * cols) |i| {
-        data[i] = 0.0;
-    }
+    @memset(data, 0.0);
 
     const matrix = Matrix{
         .rows = rows,
@@ -100,7 +98,6 @@ test "transpose" {
         }
     }
 
-    // time transpose
     const actual = try initial.transpose();
     defer actual.deinit();
 
@@ -168,10 +165,10 @@ inline fn processBlocksRange(matrix_A: *Matrix, matrix_B: *Matrix, result: *Matr
             const block_p_size = @min(p_idx * block_size + block_size, p) - (p_idx * block_size);
 
             const block_a_idx = (m_idx * n + n_idx) * block_size;
-            blockA(matrix_A, block_m_size, block_n_size, block_a_idx);
+            copyWithPaddingToBlockA(matrix_A, block_m_size, block_n_size, block_a_idx);
 
             const block_b_idx = (n_idx * p + p_idx) * block_size;
-            blockB(matrix_B, block_n_size, block_p_size, block_b_idx);
+            transposeCopyWithPaddingToBlockB(matrix_B, block_n_size, block_p_size, block_b_idx);
 
             multiplyBlocks();
 
@@ -205,50 +202,45 @@ inline fn multiplyBlocks() void {
     }
 }
 
-inline fn blockA(matrix: *Matrix, block_height: usize, block_width: usize, block_idx: usize) void {
+inline fn copyWithPaddingToBlockA(matrix: *Matrix, block_height: usize, block_width: usize, block_idx: usize) void {
     const n = matrix.cols;
 
     for (0..block_height) |i| {
-        for (0..block_width) |j| {
-            const inner_block_index = i * block_size + j;
-            const idx = block_idx + i * n + j;
+        const block_start_index = i * block_size;
+        const matrix_start_index = block_idx + i * n;
 
-            block_A[inner_block_index] = matrix.data[idx];
-        }
+        var arr: [block_size]f32 = @as([*]f32, @ptrCast((matrix.data)[matrix_start_index..]))[0..block_size].*;
+        @memcpy(block_A[block_start_index .. block_start_index + block_size], &arr);
         // zero padding
-        for (block_width..block_size) |j| {
-            block_A[i * block_size + j] = 0;
-        }
+        @memset(block_A[block_start_index + block_width .. block_start_index + block_size], 0);
     }
 
     // zero padding
     for (block_height..block_size) |i| {
-        for (0..block_size) |j| {
-            block_A[i * block_size + j] = 0;
-        }
+        const block_start_index = i * block_size;
+        @memset(block_A[block_start_index .. block_start_index + block_size], 0);
     }
 }
 
-inline fn blockB(matrix: *Matrix, block_height: usize, block_width: usize, block_idx: usize) void {
+inline fn transposeCopyWithPaddingToBlockB(matrix: *Matrix, block_height: usize, block_width: usize, block_idx: usize) void {
     const n = matrix.cols;
 
     for (0..block_height) |i| {
         for (0..block_width) |j| {
-            const inner_block_index = j * block_size + i;
+            const block_start_index = j * block_size;
             const other_idx = block_idx + i * n + j;
 
-            block_B[inner_block_index] = matrix.data[other_idx];
-        }
-        // zero padding
-        for (block_width..block_size) |j| {
-            block_B[j * block_size + i] = 0;
+            block_B[block_start_index + i] = matrix.data[other_idx];
         }
     }
 
     // zero padding
-    for (block_height..block_size) |i| {
-        for (0..block_size) |j| {
-            block_B[j * block_size + i] = 0;
+    for (0..block_size) |j| {
+        const block_start_index = j * block_size;
+        @memset(block_A[block_start_index + block_height .. block_start_index + block_size], 0);
+
+        if (j >= block_width) {
+            @memset(block_B[block_start_index .. block_start_index + block_height], 0);
         }
     }
 }
@@ -256,9 +248,9 @@ inline fn blockB(matrix: *Matrix, block_height: usize, block_width: usize, block
 test "matmul" {
     const allocator = std.testing.allocator;
 
-    const m: usize = 100;
-    const n: usize = 200;
-    const p: usize = 300;
+    const m: usize = 8;
+    const n: usize = 9;
+    const p: usize = 10;
 
     // define A: matrix going from 1 to m*n
     var A = try Matrix.init(allocator, m, n);
@@ -282,7 +274,6 @@ test "matmul" {
         }
     }
 
-    // timer
     const C = try A.matmul(&B);
     defer C.deinit();
 
