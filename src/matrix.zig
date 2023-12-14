@@ -164,32 +164,45 @@ inline fn processBlocksRange(matrix_A: *Matrix, matrix_B: *Matrix, result: *Matr
         for (0..num_p_blocks) |p_idx| {
             const block_p_size = @min(p_idx * block_size + block_size, p) - (p_idx * block_size);
 
-            const block_a_idx = (m_idx * n + n_idx) * block_size;
-            copyWithPaddingToBlockA(matrix_A, block_m_size, block_n_size, block_a_idx);
+            const block_A_idx = (m_idx * n + n_idx) * block_size;
+            copyWithPaddingToBlockA(matrix_A, block_m_size, block_n_size, block_A_idx);
 
-            const block_b_idx = (n_idx * p + p_idx) * block_size;
-            transposeCopyWithPaddingToBlockB(matrix_B, block_n_size, block_p_size, block_b_idx);
+            const block_B_idx = (n_idx * p + p_idx) * block_size;
+            transposeCopyWithPaddingToBlockB(matrix_B, block_n_size, block_p_size, block_B_idx);
 
             multiplyBlocks();
 
-            const block_c_idx = (m_idx * p + p_idx) * block_size;
-            copyBlockToMatrix(result, block_m_size, block_p_size, block_c_idx);
+            const block_C_idx = (m_idx * p + p_idx) * block_size;
+            copyBlockCToMatrix(result, block_m_size, block_p_size, block_C_idx);
         }
     }
 }
 
-inline fn copyBlockToMatrix(matrix: *Matrix, block_height: usize, block_width: usize, block_idx: usize) void {
+inline fn copyBlockCToMatrix(matrix: *Matrix, block_height: usize, block_width: usize, block_idx: usize) void {
+    @prefetch(&block_C, .{});
+
     const n = matrix.cols;
 
     for (0..block_height) |i| {
-        for (0..block_width) |j| {
-            const idx = block_idx + i * n + j;
-            matrix.data[idx] += block_C[i * block_size + j];
-        }
+        const block_start_index = i * block_size;
+        const matrix_start_index = block_idx + i * n;
+
+        const block_C_vec: @Vector(block_size, f32) = block_C[block_start_index..][0..block_size].*;
+
+        const matrix_C_ptr: [block_size]f32 = @as([*]f32, @ptrCast(&matrix.data[matrix_start_index]))[0..block_size].*;
+        const matrix_C_vec: @Vector(block_size, f32) = matrix_C_ptr;
+
+        const result: [block_size]f32 = block_C_vec + matrix_C_vec;
+
+        @memcpy(matrix.data[matrix_start_index .. matrix_start_index + block_width], result[0..block_width]);
     }
 }
 
 inline fn multiplyBlocks() void {
+    @prefetch(&block_A, .{});
+    @prefetch(&block_B, .{});
+    @prefetch(&block_C, .{ .rw = .write });
+
     inline for (0..block_size) |i| {
         inline for (0..block_size) |j| {
             const vec_A: @Vector(block_size, f32) = block_A[i * block_size ..][0..block_size].*;
@@ -203,6 +216,8 @@ inline fn multiplyBlocks() void {
 }
 
 inline fn copyWithPaddingToBlockA(matrix: *Matrix, block_height: usize, block_width: usize, block_idx: usize) void {
+    @prefetch(&block_A, .{ .rw = .write });
+
     const n = matrix.cols;
 
     for (0..block_height) |i| {
@@ -223,6 +238,8 @@ inline fn copyWithPaddingToBlockA(matrix: *Matrix, block_height: usize, block_wi
 }
 
 inline fn transposeCopyWithPaddingToBlockB(matrix: *Matrix, block_height: usize, block_width: usize, block_idx: usize) void {
+    @prefetch(&block_B, .{ .rw = .write });
+
     const n = matrix.cols;
 
     for (0..block_height) |i| {
@@ -235,7 +252,7 @@ inline fn transposeCopyWithPaddingToBlockB(matrix: *Matrix, block_height: usize,
     }
 
     // zero padding
-    for (0..block_size) |j| {
+    inline for (0..block_size) |j| {
         const block_start_index = j * block_size;
         @memset(block_A[block_start_index + block_height .. block_start_index + block_size], 0);
 
@@ -279,7 +296,7 @@ test "matmul" {
 
     // test
     const base_val: f32 = (n * (n + 1)) / 2;
-    const tol = std.math.floatEps(f32) * (n + 1);
+    const tol = (std.math.floatEps(f32) * n) * (1 + std.math.floatEps(f32));
     for (0..m) |i| {
         const i_f32: f32 = @floatFromInt(i);
         for (0..p) |j| {
