@@ -1,12 +1,15 @@
 const std = @import("std");
+
+const math = std.math;
+const mem = std.mem;
+const Allocator = mem.Allocator;
+const Thread = std.Thread;
+
 const assert = std.debug.assert;
 const debug = std.debug;
 const testing = std.testing;
-const mem = std.mem;
-const math = std.math;
-const Allocator = mem.Allocator;
 
-const MatrixError = error{
+const Error = error{
     NonMatchingDims,
     InvalidShape,
     DifferentTypes,
@@ -14,6 +17,10 @@ const MatrixError = error{
 
 const cache_line_size = 64;
 
+// TODO: fn add(), fn sub(), fn mulScaler(), fn mulRowVector, fn mulColVector
+// these can all use blocks
+// move the threading logic to the top
+// can make it quicker by pre-initing threads or by reducing thread stack size
 pub fn Matrix(comptime T: type) type {
     assert(@typeInfo(T) == .Float or @typeInfo(T) == .Int);
 
@@ -26,32 +33,44 @@ pub fn Matrix(comptime T: type) type {
         allocator: Allocator,
 
         pub fn init(allocator: Allocator, rows: usize, cols: usize) Allocator.Error!Self {
-            const data = try allocator.alignedAlloc(T, cache_line_size, rows * cols);
-
-            @memset(data, 0.0);
-
-            const self = Self{
+            return Self{
                 .rows = rows,
                 .cols = cols,
-                .data = data,
+                .data = try allocator.alignedAlloc(T, cache_line_size, rows * cols),
                 .allocator = allocator,
             };
-
-            return self;
         }
 
         pub fn deinit(self: Self) void {
             if (@sizeOf(T) > 0) {
-                self.allocator.free(self.data);
+                self.allocator.free(@as([]align(cache_line_size) T, @alignCast(self.data)));
             }
         }
 
-        pub fn identity(allocator: Allocator, rows: usize, cols: usize) !Self {
-            var matrix = try Matrix.init(allocator, rows, cols);
+        pub fn zeros(allocator: Allocator, rows: usize, cols: usize) Allocator.Error!Self {
+            const self = try Self.init(allocator, rows, cols);
+
+            @memset(self.data, 0);
+
+            return self;
+        }
+
+        pub fn ones(allocator: Allocator, rows: usize, cols: usize) Allocator.Error!Self {
+            const self = try Self.init(allocator, rows, cols);
+
+            @memset(self.data, 1);
+
+            return self;
+        }
+
+        pub fn identity(allocator: Allocator, rows: usize, cols: usize) Allocator.Error!Self {
+            var matrix = try Self.zeros(allocator, rows, cols);
+
             const diag = @max(rows, cols);
             for (0..diag) |i| {
                 matrix.data[i * rows + i] = 1;
             }
+
             return matrix;
         }
 
@@ -61,20 +80,21 @@ pub fn Matrix(comptime T: type) type {
             }
         }
 
-        pub fn reshape(self: *Self, rows: usize, cols: usize) !void {
+        pub fn reshape(self: *Self, rows: usize, cols: usize) Error!void {
             if (self.rows * self.cols != rows * cols) {
-                return MatrixError.InvalidShape;
+                return Error.InvalidShape;
             }
 
             self.rows = rows;
             self.cols = cols;
         }
 
-        pub fn transpose(self: *Self) Allocator.Error!Self {
+        // TODO: block it
+        pub fn transpose(allocator: Allocator, self: *Self) Allocator.Error!Self {
             const m = self.rows;
             const n = self.cols;
 
-            var result = try Matrix(T).init(self.allocator, n, m);
+            var result = try Matrix(T).init(allocator, n, m);
 
             for (0..m) |i| {
                 for (0..n) |j| {
@@ -92,40 +112,37 @@ pub fn Matrix(comptime T: type) type {
         threadlocal var block_B: Block align(cache_line_size) = undefined;
         threadlocal var block_C: Block align(cache_line_size) = undefined;
 
-        pub fn matmul(self: *Self, other: *Self) !Self {
-            if (self.cols != other.rows) {
-                return MatrixError.NonMatchingDims;
+        pub fn matmul(allocator: Allocator, left: *Self, right: *Self) (Error || Allocator.Error || Thread.SpawnError)!Self {
+            if (@TypeOf(left) != @TypeOf(right)) {
+                return Error.DifferentTypes;
             }
 
-            if (@TypeOf(self) != @TypeOf(other)) {
-                return MatrixError.DifferentTypes;
+            if (left.cols != right.rows) {
+                return Error.NonMatchingDims;
             }
 
-            var arena = std.heap.ArenaAllocator.init(self.allocator);
-            const allocator = arena.allocator();
-            defer arena.deinit();
+            const m = left.rows;
+            const n = right.rows;
+            const p = right.cols;
 
-            const m = self.rows;
-            const n = other.rows;
-            const p = other.cols;
-
-            var result = try Matrix(T).init(self.allocator, m, p);
+            var to = try Self.init(allocator, m, p);
 
             const num_m_blocks = (m + block_size - 1) / block_size;
             const num_n_blocks = (n + block_size - 1) / block_size;
             const num_p_blocks = (p + block_size - 1) / block_size;
 
             // emulate parallel for
-            const thread_pool_options = std.Thread.Pool.Options{ .n_jobs = @intCast(num_m_blocks), .allocator = allocator };
+            // Todo: move threads to init and use for all fns
+            const thread_pool_options = std.Thread.Pool.Options{ .n_jobs = @intCast(num_m_blocks), .allocator = to.allocator };
             var thread_pool: std.Thread.Pool = undefined;
             try thread_pool.init(thread_pool_options);
             defer thread_pool.deinit();
 
             for (0..num_m_blocks) |m_idx| {
-                try thread_pool.spawn(processBlocksRange, .{ self, other, &result, m_idx, num_n_blocks, num_p_blocks });
+                try thread_pool.spawn(processBlocksRange, .{ left, right, &to, m_idx, num_n_blocks, num_p_blocks });
             }
 
-            return result;
+            return to;
         }
 
         inline fn processBlocksRange(matrix_A: *Self, matrix_B: *Self, result: *Self, m_idx: usize, num_n_blocks: usize, num_p_blocks: usize) void {
@@ -239,16 +256,18 @@ pub fn Matrix(comptime T: type) type {
     };
 }
 
+const M32 = Matrix(f32);
+
 test "transpose" {
     const allocator = testing.allocator;
 
     const m: usize = 64;
     const n: usize = 30;
 
-    var initial = try Matrix(f32).init(allocator, m, n);
+    var initial = try M32.init(allocator, m, n);
     defer initial.deinit();
 
-    var expected = try Matrix(f32).init(allocator, n, m);
+    var expected = try M32.init(allocator, n, m);
     defer expected.deinit();
 
     var count: f32 = 1;
@@ -267,7 +286,7 @@ test "transpose" {
         }
     }
 
-    const actual = try initial.transpose();
+    const actual = try M32.transpose(allocator, &initial);
     defer actual.deinit();
 
     // verify
@@ -285,12 +304,12 @@ test "transpose" {
 test "matmul" {
     const allocator = testing.allocator;
 
-    const m: usize = 8;
-    const n: usize = 9;
-    const p: usize = 10;
+    const m: usize = 11;
+    const n: usize = 13;
+    const p: usize = 8;
 
     // define A: matrix going from 1 to m*n
-    var A = try Matrix(f32).init(allocator, m, n);
+    var A = try M32.init(allocator, m, n);
     defer A.deinit();
 
     var count: f32 = 1;
@@ -302,7 +321,7 @@ test "matmul" {
     }
 
     // define B: matrix of 1s
-    var B = try Matrix(f32).init(allocator, n, p);
+    var B = try M32.init(allocator, n, p);
     defer B.deinit();
 
     for (0..n) |i| {
@@ -311,12 +330,12 @@ test "matmul" {
         }
     }
 
-    const C = try A.matmul(&B);
+    const C = try M32.matmul(allocator, &A, &B);
     defer C.deinit();
 
     // test
     const base_val: f32 = (n * (n + 1)) / 2;
-    const tol = (std.math.floatEps(f32) * n) * (1 + std.math.floatEps(f32));
+    const tol = (math.floatEps(f32) * n) * (1 + math.floatEps(f32));
     for (0..m) |i| {
         const i_f32: f32 = @floatFromInt(i);
         for (0..p) |j| {

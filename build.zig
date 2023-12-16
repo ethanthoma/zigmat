@@ -2,7 +2,7 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{}); // change to releasefast
+    const optimize = b.standardOptimizeOption(.{});
 
     const zigmat_module = b.addModule("zigmat", .{
         .source_file = .{ .path = "src/matrix.zig" },

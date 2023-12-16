@@ -9,6 +9,13 @@ This matrix multiplication library is a high-performance implementation written 
 - **Multithreading Support**: Leverages threading for parallel computation, enhancing performance on multi-core processors.
 - **Alignment Optimized**: Ensures data structures are cache-line aligned for efficient memory access.
 
+## Notes
+
+- Limited functions at the moment
+- Only matmul is optimized at the moment
+- Plan to add more operations using matrix tiling and thread pools
+- Eventually add basic neural network functions
+
 ## Requirements
 
 - Zig compiler (version 11.0 or newer recommended)
@@ -22,16 +29,24 @@ You can install this library using the Zig package manager, ZON. Just add a "zig
 Please see `example/main.zig`. A snippet is below:
 
 ```zig
-const Matrix = @import("zigmat").Matrix;
+const M32 = @import("zigmat").Matrix(f32);
 
-var matrixA = Matrix(f32).init(...); // Initialize matrix A
-var matrixB = Matrix(f32).init(...); // Initialize matrix B
+var mat_A = M32.ones(allocator, n, n);
+defer mat_A.deinit();
 
-// Perform matrix multiplication
-var result = matrixA.matmul(matrixB) catch unreachable;
+var mat_B = M32.identity(allocator, n, p);
+defer mat_B.deinit();
+
+const mat_C = try M32.matmul(allocator, mat_A, mat_B);
+defer mat_C.deinit();
 ```
 
 ## Benchmarks
 
-There are no benchmarks ran yet. On a AMD Ryzen 7 5700G with Radeon Graphics CPU and using ReleaseFast, I get 33-39 ms for multiplying two 1024x1024 matricies.
+CPU: AMD Ryzen 7 5700 with Radeon Graphics
+
+OP: matmul
+Params: two 1024x1024 matrices
+
+Result: average of 3.503e+01 ms over 100 trials
 

@@ -1,6 +1,8 @@
 const std = @import("std");
+const mem = std.mem;
+const Allocator = mem.Allocator;
 
-const Matrix = @import("zigmat").Matrix;
+const M32 = @import("zigmat").Matrix(f32);
 
 fn prettyPrintTime(allocator: std.mem.Allocator, duration: u64) ![]const u8 {
     const sec = @as(f64, @floatFromInt(duration)) / 1_000_000_000;
@@ -18,16 +20,18 @@ fn prettyPrintTime(allocator: std.mem.Allocator, duration: u64) ![]const u8 {
     }
 }
 
+// runs 100 trials of 1024x1024 matrix multiplication and finds the average time
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
 
     const m: usize = 1024;
-    const n: usize = m;
-    const p: usize = n;
+    const n: usize = 1024;
+    const p: usize = 1024;
 
     // define A: matrix going from 1 to m*n
-    var A = try Matrix(f32).init(allocator, m, n);
+    // TODO: create range based initialization
+    var A = try M32.init(allocator, m, n);
     defer A.deinit();
 
     var count: f32 = 1;
@@ -39,34 +43,31 @@ pub fn main() !void {
     }
 
     // define B: matrix of 1s
-    var B = try Matrix(f32).init(allocator, n, p);
+    var B = try M32.ones(allocator, n, p);
     defer B.deinit();
 
-    for (0..n) |i| {
-        for (0..p) |j| {
-            B.setValue(i, j, 1);
-        }
+    const trials = 100;
+    var sum: u64 = 0;
+
+    for (0..trials) |_| {
+        sum += try testMatMul(allocator, &A, &B);
     }
 
-    // timer
-    var timer = try std.time.Timer.start();
+    const duration = sum / trials;
 
-    const C = try A.matmul(&B);
-    defer C.deinit();
-
-    const duration = timer.read();
     const time = try prettyPrintTime(allocator, duration);
     defer allocator.free(time);
 
-    std.debug.print("\nMatrix multiplication of a {}x{} matrix and a {}x{} matrix took {s}.\n", .{ m, n, n, p, time });
+    std.debug.print("\nMatrix multiplication of two {}x{} matrices took an average of {s} over {} trials.\n", .{ n, n, time, trials });
+}
 
-    // test
-    const base_val: f32 = (n * (n + 1)) / 2;
-    const tol = std.math.floatEps(f32) * (n + 1);
-    for (0..m) |i| {
-        const i_f32: f32 = @floatFromInt(i);
-        for (0..p) |j| {
-            try std.testing.expectApproxEqRel(base_val + i_f32 * n * n, C.data[i * p + j], tol);
-        }
-    }
+fn testMatMul(allocator: Allocator, A: *M32, B: *M32) !u64 {
+    var timer = try std.time.Timer.start();
+
+    const C = try M32.matmul(allocator, A, B);
+    defer C.deinit();
+
+    const duration = timer.read();
+
+    return duration;
 }
