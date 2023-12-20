@@ -29,15 +29,15 @@ You can install this library using the Zig package manager, ZON. Just add a "zig
 Please see `example/main.zig`. A snippet is below:
 
 ```zig
-const M32 = @import("zigmat").Matrix(f32);
+const zigmat = @import("zigmat");
 
-var mat_A = M32.ones(allocator, n, n);
+var mat_A = zigmat.ones(f32, allocator, n, n);
 defer mat_A.deinit();
 
-var mat_B = M32.identity(allocator, n, p);
+var mat_B = zigmat.identity(f32, allocator, n, p);
 defer mat_B.deinit();
 
-const mat_C = try M32.matmul(allocator, mat_A, mat_B);
+const mat_C = try zigmat.Matrix(f32).matmul(allocator, mat_A, mat_B);
 defer mat_C.deinit();
 ```
 
@@ -46,7 +46,8 @@ defer mat_C.deinit();
 CPU: AMD Ryzen 7 5700 with Radeon Graphics
 
 OP: matmul
+
 Params: two 1024x1024 matrices
 
-Result: average of 3.503e+01 ms over 100 trials
+Result: average of 3.478e+01 ms over 100 trials
 

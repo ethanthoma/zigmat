@@ -17,6 +17,11 @@ const Error = error{
 
 const cache_line_size = 64;
 
+pub usingnamespace @import("init/identity.zig");
+pub usingnamespace @import("init/full.zig");
+
+const blk = @import("block/block.zig");
+
 // TODO: fn add(), fn sub(), fn mulScaler(), fn mulRowVector, fn mulColVector
 // these can all use blocks
 // move the threading logic to the top
@@ -32,6 +37,14 @@ pub fn Matrix(comptime T: type) type {
         data: []T,
         allocator: Allocator,
 
+        const block_size = blk.block_size(T);
+        const Block = blk.Block(T);
+        const BlockInfo = blk.BlockInfo(T);
+
+        threadlocal var block_A: Block align(cache_line_size) = undefined;
+        threadlocal var block_B: Block align(cache_line_size) = undefined;
+        threadlocal var block_C: Block align(cache_line_size) = undefined;
+
         pub fn init(allocator: Allocator, rows: usize, cols: usize) Allocator.Error!Self {
             return Self{
                 .rows = rows,
@@ -45,33 +58,6 @@ pub fn Matrix(comptime T: type) type {
             if (@sizeOf(T) > 0) {
                 self.allocator.free(@as([]align(cache_line_size) T, @alignCast(self.data)));
             }
-        }
-
-        pub fn zeros(allocator: Allocator, rows: usize, cols: usize) Allocator.Error!Self {
-            const self = try Self.init(allocator, rows, cols);
-
-            @memset(self.data, 0);
-
-            return self;
-        }
-
-        pub fn ones(allocator: Allocator, rows: usize, cols: usize) Allocator.Error!Self {
-            const self = try Self.init(allocator, rows, cols);
-
-            @memset(self.data, 1);
-
-            return self;
-        }
-
-        pub fn identity(allocator: Allocator, rows: usize, cols: usize) Allocator.Error!Self {
-            var matrix = try Self.zeros(allocator, rows, cols);
-
-            const diag = @max(rows, cols);
-            for (0..diag) |i| {
-                matrix.data[i * rows + i] = 1;
-            }
-
-            return matrix;
         }
 
         pub fn setValue(self: *Self, row: usize, col: usize, value: T) void {
@@ -89,28 +75,31 @@ pub fn Matrix(comptime T: type) type {
             self.cols = cols;
         }
 
-        // TODO: block it
         pub fn transpose(allocator: Allocator, self: *Self) Allocator.Error!Self {
             const m = self.rows;
             const n = self.cols;
 
-            var result = try Matrix(T).init(allocator, n, m);
+            var result = try Self.init(allocator, n, m);
 
-            for (0..m) |i| {
-                for (0..n) |j| {
-                    result.data[j * m + i] = self.data[i * n + j];
+            const num_m_blocks = (m + block_size - 1) / block_size;
+            const num_n_blocks = (n + block_size - 1) / block_size;
+
+            for (0..num_m_blocks) |m_idx| {
+                const block_m_size = @min(m_idx * block_size + block_size, m) - (m_idx * block_size);
+                for (0..num_n_blocks) |n_idx| {
+                    const block_n_size = @min(n_idx * block_size + block_size, n) - (n_idx * block_size);
+
+                    const from_index = (m_idx * n + n_idx) * block_size;
+                    const to_index = (n_idx * m + m_idx) * block_size;
+
+                    zeroPaddedTransposeCopyToBlock(self, from_index, .{ .data = &block_A, .height = block_m_size, .width = block_n_size });
+
+                    blk.copyBlockToMatrix(T, &result, to_index, .{ .data = &block_A, .height = block_n_size, .width = block_m_size });
                 }
             }
 
             return result;
         }
-
-        const block_size = cache_line_size / @sizeOf(T);
-        const Block = [block_size * block_size]T;
-
-        threadlocal var block_A: Block align(cache_line_size) = undefined;
-        threadlocal var block_B: Block align(cache_line_size) = undefined;
-        threadlocal var block_C: Block align(cache_line_size) = undefined;
 
         pub fn matmul(allocator: Allocator, left: *Self, right: *Self) (Error || Allocator.Error || Thread.SpawnError)!Self {
             if (@TypeOf(left) != @TypeOf(right)) {
@@ -154,103 +143,95 @@ pub fn Matrix(comptime T: type) type {
 
             for (0..num_n_blocks) |n_idx| {
                 const block_n_size = @min(n_idx * block_size + block_size, n) - (n_idx * block_size);
+                const block_A_idx = (m_idx * n + n_idx) * block_size;
+
+                zeroPaddedCopyToBlock(matrix_A, block_A_idx, .{ .data = &block_A, .height = block_m_size, .width = block_n_size });
+
                 for (0..num_p_blocks) |p_idx| {
                     const block_p_size = @min(p_idx * block_size + block_size, p) - (p_idx * block_size);
 
-                    const block_A_idx = (m_idx * n + n_idx) * block_size;
-                    copyWithPaddingToBlockA(matrix_A, block_m_size, block_n_size, block_A_idx);
-
                     const block_B_idx = (n_idx * p + p_idx) * block_size;
-                    transposeCopyWithPaddingToBlockB(matrix_B, block_n_size, block_p_size, block_B_idx);
+                    zeroPaddedTransposeCopyToBlock(matrix_B, block_B_idx, .{ .data = &block_B, .height = block_n_size, .width = block_p_size });
 
-                    multiplyBlocks();
+                    multiplyBlocksIntoBlock(&block_A, &block_B, &block_C);
 
                     const block_C_idx = (m_idx * p + p_idx) * block_size;
-                    copyBlockCToMatrix(result, block_m_size, block_p_size, block_C_idx);
+                    blk.copyBlockToMatrix(T, result, block_C_idx, .{ .data = &block_C, .height = block_m_size, .width = block_p_size });
                 }
             }
         }
 
-        inline fn copyBlockCToMatrix(matrix: *Self, block_height: usize, block_width: usize, block_idx: usize) void {
-            @prefetch(&block_C, .{});
-
-            const n = matrix.cols;
-
-            for (0..block_height) |i| {
-                const block_start_index = i * block_size;
-                const matrix_start_index = block_idx + i * n;
-
-                const block_C_vec: @Vector(block_size, T) = block_C[block_start_index..][0..block_size].*;
-
-                const matrix_C_ptr: [block_size]T = @as([*]T, @ptrCast(&matrix.data[matrix_start_index]))[0..block_size].*;
-                const matrix_C_vec: @Vector(block_size, T) = matrix_C_ptr;
-
-                const result: [block_size]T = block_C_vec + matrix_C_vec;
-
-                @memcpy(matrix.data[matrix_start_index .. matrix_start_index + block_width], result[0..block_width]);
-            }
-        }
-
-        inline fn multiplyBlocks() void {
-            @prefetch(&block_A, .{});
-            @prefetch(&block_B, .{});
-            @prefetch(&block_C, .{ .rw = .write });
+        // does A*B = C, where A is row-major and B is col-major
+        inline fn multiplyBlocksIntoBlock(left: *Block, right: *Block, to: *Block) void {
+            @prefetch(&left, .{});
+            @prefetch(&right, .{});
+            @prefetch(&to, .{ .rw = .write });
 
             inline for (0..block_size) |i| {
-                const vec_A: @Vector(block_size, T) = block_A[i * block_size ..][0..block_size].*;
+                const left_vec: @Vector(block_size, T) = left[i * block_size ..][0..block_size].*;
 
                 inline for (0..block_size) |j| {
-                    const vec_B: @Vector(block_size, T) = block_B[j * block_size ..][0..block_size].*;
+                    const right_vec: @Vector(block_size, T) = right[j * block_size ..][0..block_size].*;
 
-                    block_C[i * block_size + j] = @reduce(.Add, vec_A * vec_B);
+                    to[i * block_size + j] = @reduce(.Add, left_vec * right_vec);
                 }
             }
         }
 
-        inline fn copyWithPaddingToBlockA(matrix: *Self, block_height: usize, block_width: usize, block_idx: usize) void {
-            @prefetch(&block_A, .{ .rw = .write });
+        inline fn zeroPaddedCopyToBlock(matrix: *Self, matrix_index: usize, block_info: BlockInfo) void {
+            @prefetch(block_info.data, .{ .rw = .write });
 
             const n = matrix.cols;
 
-            for (0..block_height) |i| {
+            for (0..block_info.height) |i| {
                 const block_start_index = i * block_size;
-                const matrix_start_index = block_idx + i * n;
+                const matrix_start_index = matrix_index + i * n;
 
                 var arr: [block_size]T = @as([*]T, @ptrCast((matrix.data)[matrix_start_index..]))[0..block_size].*;
-                @memcpy(block_A[block_start_index .. block_start_index + block_size], &arr);
+                @memcpy(block_info.data[block_start_index .. block_start_index + block_size], &arr);
                 // zero padding
-                @memset(block_A[block_start_index + block_width .. block_start_index + block_size], 0);
+                @memset(block_info.data[block_start_index + block_info.width .. block_start_index + block_size], 0);
             }
 
             // zero padding
-            for (block_height..block_size) |i| {
+            for (block_info.height..block_size) |i| {
                 const block_start_index = i * block_size;
-                @memset(block_A[block_start_index .. block_start_index + block_size], 0);
+                @memset(block_info.data[block_start_index .. block_start_index + block_size], 0);
             }
         }
 
-        inline fn transposeCopyWithPaddingToBlockB(matrix: *Self, block_height: usize, block_width: usize, block_idx: usize) void {
-            @prefetch(&block_B, .{ .rw = .write });
+        inline fn zeroPaddedTransposeCopyToBlock(matrix: *Self, matrix_index: usize, block_info: BlockInfo) void {
+            @prefetch(block_info.data, .{ .rw = .write });
 
             const n = matrix.cols;
 
-            for (0..block_height) |i| {
-                for (0..block_width) |j| {
+            for (0..block_info.height) |i| {
+                for (0..block_info.width) |j| {
                     const block_start_index = j * block_size;
-                    const other_idx = block_idx + i * n + j;
+                    const other_idx = matrix_index + i * n + j;
 
-                    block_B[block_start_index + i] = matrix.data[other_idx];
+                    block_info.data[block_start_index + i] = matrix.data[other_idx];
                 }
             }
 
             // zero padding
             inline for (0..block_size) |j| {
                 const block_start_index = j * block_size;
-                @memset(block_B[block_start_index + block_height .. block_start_index + block_size], 0);
+                @memset(block_info.data[block_start_index + block_info.height .. block_start_index + block_size], 0);
 
-                if (j >= block_width) {
-                    @memset(block_B[block_start_index .. block_start_index + block_height], 0);
+                if (j >= block_info.width) {
+                    @memset(block_info.data[block_start_index .. block_start_index + block_info.height], 0);
                 }
+            }
+        }
+
+        pub fn print(self: *const Self) void {
+            std.debug.print("\n", .{});
+            for (0..self.rows) |i| {
+                for (0..self.cols) |j| {
+                    std.debug.print("{}\t", .{self.data[i * self.cols + j]});
+                }
+                std.debug.print("\n", .{});
             }
         }
     };
@@ -261,8 +242,8 @@ const M32 = Matrix(f32);
 test "transpose" {
     const allocator = testing.allocator;
 
-    const m: usize = 64;
-    const n: usize = 30;
+    const m: usize = M32.block_size;
+    const n: usize = M32.block_size + 1;
 
     var initial = try M32.init(allocator, m, n);
     defer initial.deinit();
@@ -304,9 +285,9 @@ test "transpose" {
 test "matmul" {
     const allocator = testing.allocator;
 
-    const m: usize = 11;
-    const n: usize = 13;
-    const p: usize = 8;
+    const m: usize = M32.block_size;
+    const n: usize = M32.block_size + 1;
+    const p: usize = M32.block_size + 2;
 
     // define A: matrix going from 1 to m*n
     var A = try M32.init(allocator, m, n);
